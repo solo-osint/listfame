@@ -13,6 +13,20 @@ from collector import bounded_collect
 
 ROOT = Path(__file__).resolve().parent
 load_dotenv(ROOT / '.env')
+PROGRESS_EVERY_PAGES = 3
+PROGRESS_EVERY_SECONDS = 15
+
+
+def flood_text(seconds):
+    return f'Telegram просит подождать ещё {seconds} секунд перед повторной выгрузкой этого чата.'
+
+
+def progress_due(seen_pages, reported_pages, now, last_report):
+    if seen_pages - reported_pages < PROGRESS_EVERY_PAGES:
+        return False
+    if last_report is not None and now - last_report < PROGRESS_EVERY_SECONDS:
+        return False
+    return True
 
 
 class App:
@@ -21,6 +35,7 @@ class App:
         self.jobs = {}
         self.queue = asyncio.Semaphore(1)
         self.results = {}  # at most 20 users, expires after 10 minutes
+        self.flood_until = {}  # chat id -> monotonic deadline; no automatic retry
         self.timeout = max(10, min(270, int(os.getenv('EXPORT_TIMEOUT', '240'))))
         self.max_members = max(1, min(100000, int(os.getenv('MAX_MEMBERS', '100000'))))
 
@@ -62,14 +77,57 @@ class App:
             await asyncio.sleep(5)
             self.prune()
 
+    def note_flood(self, chat_id, seconds):
+        seconds = int(seconds)
+        if seconds <= 0:
+            return
+        until = time.monotonic() + seconds
+        self.flood_until[chat_id] = max(self.flood_until.get(chat_id, 0), until)
+
+    def flood_left(self, chat_id):
+        until = self.flood_until.get(chat_id)
+        if not until:
+            return 0
+        left = until - time.monotonic()
+        if left <= 0:
+            self.flood_until.pop(chat_id, None)
+            return 0
+        return max(1, int(left + 0.999))
+
     async def export(self, uid, chat_id):
         try:
             async with self.queue:
                 chat = await self.rights(uid, chat_id)  # recheck after queue
+                left = self.flood_left(chat['id'])
+                if left:
+                    await self.api.send(uid, flood_text(left))
+                    return
                 await self.api.send(uid, 'Сбор начался. /cancel — отменить.')
                 before = await self.api.call('getChatMemberCount', chat_id=chat['id'])
                 rows = {}
-                reason = await bounded_collect(self.mt, chat, rows, self.max_members, self.timeout)
+                seen_pages = reported_pages = 0
+                last_report = None
+
+                async def on_progress(count):
+                    nonlocal seen_pages, reported_pages, last_report
+                    seen_pages += 1
+                    now = time.monotonic()
+                    if not progress_due(seen_pages, reported_pages, now, last_report):
+                        return
+                    reported_pages, last_report = seen_pages, now
+                    try:
+                        await self.api.send(uid, f'Получено {count}.')
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        pass
+
+                def on_flood(seconds):
+                    self.note_flood(chat['id'], seconds)
+
+                reason = await bounded_collect(
+                    self.mt, chat, rows, self.max_members, self.timeout,
+                    on_progress=on_progress, on_flood=on_flood)
                 # Enrich admin titles and roles from Bot API (including anonymous bots skipped there).
                 admins = await self.api.call('getChatAdministrators', chat_id=chat['id'])
                 for a in admins:
@@ -165,6 +223,10 @@ class App:
             try:
                 chat_id = m['chat_shared']['chat_id'] if m.get('chat_shared') else target(text)
                 chat = await self.rights(uid, chat_id)
+                left = self.flood_left(chat['id'])
+                if left:
+                    await self.api.send(uid, flood_text(left))
+                    return
                 await self.api.send(uid, 'Права проверены. Заявка принята; впереди заявок: ' + str(len(self.jobs)))
                 self.jobs[uid] = asyncio.create_task(self.export(uid, chat['id']))
             except ValueError as e:

@@ -11,7 +11,7 @@ def member(user, participant):
                   getattr(participant, 'rank', None) or getattr(participant, 'title', None) or '')
 
 
-async def collect(client, chat, rows, max_members):
+async def collect(client, chat, rows, max_members, on_progress=None):
     """Mutates rows so timeout/FloodWait retains already received pages."""
     if chat['type'] == 'group':
         result = await client(functions.messages.GetFullChatRequest(chat['id'] * -1))
@@ -45,17 +45,21 @@ async def collect(client, chat, rows, max_members):
         if new == 0:
             return 'Telegram повторил страницу без новых участников; выдача остановлена.'
         offset += len(page.participants)
+        if on_progress:
+            await on_progress(len(rows))
         await asyncio.sleep(.35)
     return 'Достигнут установленный лимит количества участников.'
 
 
-async def bounded_collect(client, chat, rows, max_members, seconds):
+async def bounded_collect(client, chat, rows, max_members, seconds, on_progress=None, on_flood=None):
     try:
         async with asyncio.timeout(seconds):
-            return await collect(client, chat, rows, max_members)
+            return await collect(client, chat, rows, max_members, on_progress)
     except TimeoutError:
         return f'Достигнут лимит времени {seconds} секунд; результат частичный.'
     except errors.FloodWaitError as e:
+        if on_flood:
+            on_flood(e.seconds)
         return f'Telegram требует паузу {e.seconds} секунд (FloodWait); результат частичный. Повторите позже.'
     except errors.RPCError as e:
         return f'Telegram ограничил выдачу ({type(e).__name__}); результат частичный.'
