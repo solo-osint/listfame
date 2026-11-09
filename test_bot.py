@@ -9,7 +9,7 @@ from openpyxl import load_workbook
 from telethon import types, errors
 from bot import App, progress_due
 from collector import bounded_collect, collect, member
-from export_core import Member, authorized, target, write_files, chunks
+from export_core import Member, authorized, target, write_files, chunks, clean_needle, filter_lines
 
 
 class CoreTests(unittest.TestCase):
@@ -64,6 +64,20 @@ class CoreTests(unittest.TestCase):
         self.assertTrue(progress_due(3, 0, 1000, None))
         self.assertFalse(progress_due(6, 3, 1001, 1000))
         self.assertTrue(progress_due(7, 3, 1020, 1000))
+
+    def test_filter_keeps_flag_in_name_only(self):
+        flag = '🇪🇸'
+        rows = [
+            Member(flag + ' Анна', 'anna', 2, 'admin', 'Дизайнер'),
+            Member('Пётр', 'petr', 1, 'member', flag + ' скрытый'),
+            Member(flag + '\nМария', 'maria', 3, 'member', ''),
+            Member('Анна', 'anna2', 4, 'member', ''),
+        ]
+        lines, with_flag, without = filter_lines(rows, flag + '\ufe0f')
+        self.assertEqual(lines, [flag + ' Анна - Дизайнер', flag + ' Мария - —'])
+        self.assertEqual((with_flag, without), (2, 2))
+        self.assertEqual(clean_needle('   '), '')
+        self.assertEqual(clean_needle('я' * 33), '')
 
 
 class AsyncTests(unittest.IsolatedAsyncioTestCase):
@@ -210,6 +224,8 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
         app.flood_until[-1005] = time.monotonic() - 1
         with patch('bot.bounded_collect', AsyncMock(return_value='ок')) as collect:
             await app.update(request)
+            await app.update({'callback_query': {'id': 'c', 'from': {'id': 1},
+                'message': {'chat': {'id': 1, 'type': 'private'}}, 'data': 'c:no'}})
             pending = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
             if pending:
                 await asyncio.gather(*pending)
@@ -226,6 +242,8 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
         app.note_flood(-1005, 42)
         with patch('bot.bounded_collect', AsyncMock(return_value='ок')) as collect:
             await app.update({'message': {'chat': {'id': 1, 'type': 'private'}, 'from': {'id': 1}, 'text': '-1006'}})
+            await app.update({'callback_query': {'id': 'c', 'from': {'id': 1},
+                'message': {'chat': {'id': 1, 'type': 'private'}}, 'data': 'c:no'}})
             pending = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
             if pending:
                 await asyncio.gather(*pending)
@@ -282,6 +300,36 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(seen, [42])
         self.assertIn('42', reason)
         self.assertEqual(len(rows), 1)
+
+    async def test_link_asks_then_emoji_filters_the_list(self):
+        flag = '🇪🇸'
+        api = NS(send=AsyncMock(), call=AsyncMock(side_effect=[True, 3, [], 3]), document=AsyncMock())
+        app = App(api, None, 99)
+        app.rights = AsyncMock(return_value={'id': -1005, 'type': 'channel', 'title': 'Чат'})
+        await app.update({'message': {'chat': {'id': 1, 'type': 'private'}, 'from': {'id': 1}, 'text': '-1005'}})
+        self.assertNotIn(1, app.jobs)
+        self.assertIn('фильтр', api.send.await_args.args[1].lower())
+        await app.update({'callback_query': {'id': 'c', 'from': {'id': 1},
+            'message': {'chat': {'id': 1, 'type': 'private'}}, 'data': 'c:yes'}})
+        self.assertEqual(app.pending[1]['mode'], 'emoji')
+
+        async def fake(client, chat, rows, *args, **kwargs):
+            rows[1] = Member(flag + ' Анна', 'anna', 1, 'admin', 'Дизайнер')
+            rows[2] = Member('Пётр', 'petr', 2, 'member', 'Охрана')
+            return 'готово'
+
+        with patch('bot.bounded_collect', fake):
+            await app.update({'message': {'chat': {'id': 1, 'type': 'private'}, 'from': {'id': 1}, 'text': flag}})
+            pending = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+            if pending:
+                await asyncio.gather(*pending)
+        texts = [c.args[1] for c in api.send.await_args_list]
+        joined = '\n'.join(texts)
+        self.assertIn(flag + ' Анна - Дизайнер', joined)
+        self.assertNotIn('Пётр', joined)
+        self.assertNotIn('Охрана', joined)
+        self.assertIn('С флагом: 1\nБез флага: 1', joined)
+        api.document.assert_not_awaited()
 
 
 if __name__ == '__main__':

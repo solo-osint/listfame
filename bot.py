@@ -8,7 +8,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from telethon import TelegramClient
 from telegram_api import BotAPI, ApiError
-from export_core import authorized, target, chunks, line, write_files
+from export_core import authorized, target, chunks, line, write_files, clean_needle, filter_lines
 from collector import bounded_collect
 
 ROOT = Path(__file__).resolve().parent
@@ -35,6 +35,7 @@ class App:
         self.jobs = {}
         self.queue = asyncio.Semaphore(1)
         self.results = {}  # at most 20 users, expires after 10 minutes
+        self.pending = {}  # uid -> chosen chat while the filter question is unanswered
         self.flood_until = {}  # chat id -> monotonic deadline; no automatic retry
         self.timeout = max(10, min(270, int(os.getenv('EXPORT_TIMEOUT', '240'))))
         self.max_members = max(1, min(100000, int(os.getenv('MAX_MEMBERS', '100000'))))
@@ -62,6 +63,7 @@ class App:
             'Проверю ваши права администратора именно этого чата.\n'
             'Если кнопки недоступны, отправьте @username, https://t.me/username или числовой ID чата. '
             'Пригласительные ссылки не поддерживаются.\n'
+            'После ссылки спрошу: вся выгрузка или только люди с выбранным эмодзи в нике.\n'
             'Выгрузка: Excel, TXT и текст по кнопке. Telegram может отдать лишь часть списка. '
             'Обычно сбор ограничен четырьмя минутами, очередь и отправка файлов занимают дополнительное время.\n'
             '/cancel — отменить, /delete — удалить сохранённый текст.', reply_markup=keyboard)
@@ -69,8 +71,11 @@ class App:
     def prune(self):
         now = time.monotonic()
         self.results = {k: v for k, v in self.results.items() if v['expires'] > now}
+        self.pending = {k: v for k, v in self.pending.items() if v['expires'] > now}
         while len(self.results) > 20:
             del self.results[next(iter(self.results))]
+        while len(self.pending) > 20:
+            del self.pending[next(iter(self.pending))]
 
     async def cleanup(self):
         while True:
@@ -94,7 +99,29 @@ class App:
             return 0
         return max(1, int(left + 0.999))
 
-    async def export(self, uid, chat_id):
+    def ask_filter(self, uid, chat_id):
+        self.pending[uid] = {'chat_id': chat_id, 'mode': 'choose', 'expires': time.monotonic() + 600}
+        return ('Выгрузить без фильтра или искать по эмодзи в нике?',
+                {'inline_keyboard': [[
+                    {'text': 'Без фильтров', 'callback_data': 'c:no'},
+                    {'text': 'С фильтром', 'callback_data': 'c:yes'}]]})
+
+    async def enqueue(self, uid, chat_id, needle):
+        if uid in self.jobs:
+            await self.api.send(uid, 'Ваша выгрузка уже в очереди или выполняется. /cancel — отменить.')
+            return
+        if len(self.jobs) >= 10:
+            await self.api.send(uid, 'Очередь заполнена. Повторите позже.')
+            return
+        left = self.flood_left(chat_id)
+        if left:
+            await self.api.send(uid, flood_text(left))
+            return
+        self.pending.pop(uid, None)
+        await self.api.send(uid, 'Права проверены. Заявка принята; впереди заявок: ' + str(len(self.jobs)))
+        self.jobs[uid] = asyncio.create_task(self.export(uid, chat_id, needle))
+
+    async def export(self, uid, chat_id, needle=None):
         try:
             async with self.queue:
                 chat = await self.rights(uid, chat_id)  # recheck after queue
@@ -145,6 +172,13 @@ class App:
                     + reason + '\nПодпись указана только там, где её предоставил Telegram. '
                     'Отсутствующее поле не означает, что подписи нет в Telegram.')
                 members = sorted(rows.values(), key=lambda m: m.user_id)
+                if needle:
+                    lines, with_flag, without = filter_lines(members, needle)
+                    text = '\n'.join(lines) if lines else 'Никого с таким знаком в нике нет.'
+                    for page in chunks(text):
+                        await self.api.send(uid, page)
+                    await self.api.send(uid, f'С флагом: {with_flag}\nБез флага: {without}')
+                    return
                 with tempfile.TemporaryDirectory(prefix='tg_export_') as folder:
                     txt, xlsx = await asyncio.to_thread(write_files, Path(folder), members, summary)
                     await self.api.send(uid, summary)
@@ -179,6 +213,22 @@ class App:
             message = cb.get('message', {})
             if message.get('chat', {}).get('type') != 'private' or message['chat']['id'] != uid:
                 return
+            if cb.get('data') in ('c:no', 'c:yes'):
+                if uid in self.jobs:
+                    await self.api.send(uid, 'Ваша выгрузка уже в очереди или выполняется. /cancel — отменить.')
+                    return
+                item = self.pending.get(uid)
+                if not item or item['expires'] <= time.monotonic():
+                    self.pending.pop(uid, None)
+                    await self.api.send(uid, 'Сначала отправьте ссылку на чат.')
+                    return
+                if cb.get('data') == 'c:yes':
+                    item['mode'] = 'emoji'
+                    item['expires'] = time.monotonic() + 600
+                    await self.api.send(uid, 'Отправьте эмодзи. В список попадут только люди, у которых он есть в нике. Например: 🇪🇸')
+                    return
+                await self.enqueue(uid, item['chat_id'], None)
+                return
             r = self.results.get(uid)
             parts = cb.get('data', '').split(':')
             if not r or len(parts) != 3 or parts[:2] != ['t', r['nonce']]:
@@ -205,12 +255,16 @@ class App:
         uid = m['from']['id']
         text = m.get('text', '').strip()
         if text in ('/start', '/help'):
+            self.pending.pop(uid, None)
             await self.start(uid)
         elif text in ('/cancel', '/delete'):
+            had_choice = self.pending.pop(uid, None) is not None
             self.results.pop(uid, None)
             job = self.jobs.get(uid)
             if job:
                 job.cancel()
+            elif had_choice:
+                await self.api.send(uid, 'Выбор фильтра отменён.')
             else:
                 await self.api.send(uid, 'Сохранённый текст удалён. Активной выгрузки нет.')
         else:
@@ -220,6 +274,26 @@ class App:
             if len(self.jobs) >= 10:
                 await self.api.send(uid, 'Очередь заполнена. Повторите позже.')
                 return
+            item = self.pending.get(uid)
+            if item and item['expires'] <= time.monotonic():
+                self.pending.pop(uid, None)
+                item = None
+            fresh_link = bool(m.get('chat_shared'))
+            if not fresh_link and text:
+                try:
+                    target(text)
+                    fresh_link = True
+                except ValueError:
+                    fresh_link = False
+            if item and item['mode'] == 'emoji' and not fresh_link:
+                if not clean_needle(text):
+                    await self.api.send(uid, 'Отправьте эмодзи, например 🇪🇸.')
+                    return
+                await self.enqueue(uid, item['chat_id'], text)
+                return
+            if item and item['mode'] == 'choose' and not fresh_link:
+                await self.api.send(uid, 'Нажмите «Без фильтров» или «С фильтром».')
+                return
             try:
                 chat_id = m['chat_shared']['chat_id'] if m.get('chat_shared') else target(text)
                 chat = await self.rights(uid, chat_id)
@@ -227,8 +301,8 @@ class App:
                 if left:
                     await self.api.send(uid, flood_text(left))
                     return
-                await self.api.send(uid, 'Права проверены. Заявка принята; впереди заявок: ' + str(len(self.jobs)))
-                self.jobs[uid] = asyncio.create_task(self.export(uid, chat['id']))
+                question, keyboard = self.ask_filter(uid, chat['id'])
+                await self.api.send(uid, question, reply_markup=keyboard)
             except ValueError as e:
                 await self.api.send(uid, str(e))
             except ApiError:
